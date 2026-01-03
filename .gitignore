@@ -1,0 +1,23 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / frontend
+node_modules/
+dist/
+*.local
+
+# Tauri
+apps/*/src-tauri/gen/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local secrets
+.env
+.env.*
+*.pem
+*.key

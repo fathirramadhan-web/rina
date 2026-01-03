@@ -1,0 +1,7 @@
+[package]
+name = "rina-app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rina-core = { workspace = true }
