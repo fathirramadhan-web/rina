@@ -28,12 +28,12 @@ impl SftpClient {
         let dir = self.sftp.read_dir(path).await.map_err(sftp_err)?;
         let mut out = Vec::new();
         for entry in dir {
-            let entry = entry.map_err(sftp_err)?;
+            let metadata = entry.metadata();
             out.push(DirEntry {
                 name: entry.file_name(),
-                is_dir: entry.metadata.is_dir(),
-                is_symlink: entry.metadata.is_symlink(),
-                size: entry.metadata.len().unwrap_or(0),
+                is_dir: metadata.is_dir(),
+                is_symlink: metadata.is_symlink(),
+                size: metadata.len(),
             });
         }
         Ok(out)
@@ -67,13 +67,15 @@ impl SftpClient {
 
     /// Canonical absolute path of `path`.
     pub async fn canonicalize(&self, path: &str) -> Result<String> {
-        let s = self.sftp.canonicalize(path).await.map_err(sftp_err)?;
-        Ok(s.to_string_lossy().into_owned())
+        Ok(self.sftp.canonicalize(path).await.map_err(sftp_err)?.into())
     }
 
     /// Set permissions on a path (octal, e.g. 0o755).
     pub async fn set_permissions(&self, path: &str, mode: u32) -> Result<()> {
-        let attrs = russh_sftp::protocol::FileAttributes::default().with_permissions(mode);
+        let attrs = russh_sftp::protocol::FileAttributes {
+            permissions: Some(mode),
+            ..Default::default()
+        };
         self.sftp.set_metadata(path, attrs).await.map_err(sftp_err)
     }
 
@@ -90,6 +92,6 @@ pub struct DirEntry {
     pub size: u64,
 }
 
-fn sftp_err(e: russh_sftp::Error) -> SshError {
+fn sftp_err(e: russh_sftp::client::error::Error) -> SshError {
     SshError::Sftp(e.to_string())
 }

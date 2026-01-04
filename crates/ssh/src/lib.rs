@@ -8,7 +8,8 @@ pub mod sftp;
 pub mod shell;
 
 pub use client::{
-    fingerprint, AuthMethod, ConnectConfig, HostKeyInfo, HostKeyStore, Interaction, SshConnection,
+    authenticate_keyboard_interactive, fingerprint, AuthMethod, ConnectConfig, HeadlessInteraction,
+    HostKeyInfo, HostKeyStore, Interaction, MemHostKeyStore, SshConnection, VeraHandler,
 };
 pub use error::{Result, SshError};
 pub use shell::{ShellEvent, ShellHandle, ShellOptions};

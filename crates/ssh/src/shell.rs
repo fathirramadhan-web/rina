@@ -95,7 +95,7 @@ where
     // Reader task: forward output to the event callback.
     tokio::spawn(async move {
         let mut exit_status = None;
-        while let Some(msg) = reader.recv().await {
+        while let Some(msg) = reader.wait().await {
             match msg {
                 ChannelMsg::Data { data } => on_event(ShellEvent::Data(data.to_vec())),
                 ChannelMsg::ExtendedData { data, .. } => on_event(ShellEvent::Data(data.to_vec())),
