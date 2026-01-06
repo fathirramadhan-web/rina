@@ -3719,11 +3719,14 @@ dependencies = [
 name = "rina-app"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "base64 0.22.1",
  "rina-core",
  "rina-ssh",
  "serde",
  "serde_json",
  "tauri",
+ "tauri-build",
  "tokio",
  "tracing",
  "tracing-subscriber",
