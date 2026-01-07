@@ -21,3 +21,5 @@ Thumbs.db
 .env.*
 *.pem
 *.key
+# ---
+cache_build.log
