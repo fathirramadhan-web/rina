@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useApp, type Tab } from "./store";
 import { TermView } from "./TermView";
+import { Dialogs, Toasts, SftpPanel, Icon as UIIcon } from "./ui";
 import * as ipc from "./ipc";
 
 // SVG icon set — no icon-font dependency, no decorative text.
@@ -48,6 +49,12 @@ export default function App() {
   const tabs = useApp((s) => s.tabs);
   const activeTab = useApp((s) => s.activeTab);
   const sidebarOpen = useApp((s) => s.sidebarOpen);
+  const sftpOpen = useApp((s) => s.sftp.open);
+  const vaultLocked = useApp((s) => s.vaultLocked);
+  const hasVault = useApp((s) => s.hasVault);
+  const setDialog = useApp((s) => s.setDialog);
+  const toast = useApp((s) => s.toast);
+  const toggleSftp = useApp((s) => s.toggleSftp);
   const { setHosts, addTab, removeTab, setActiveTab, toggleSidebar } = useApp();
   const [filter, setFilter] = useState("");
   const [sessions, setSessions] = useState<Record<string, string>>({}); // tabId -> sessionId
@@ -56,6 +63,17 @@ export default function App() {
   useEffect(() => {
     ipc.listHosts().then(setHosts).catch(() => setHosts([]));
   }, [setHosts]);
+
+  // Vault unlock prompt on startup when a vault exists.
+  const vaultChecked = useRef(false);
+  useEffect(() => {
+    if (vaultChecked.current) return;
+    vaultChecked.current = true;
+    ipc.vaultExists().then((exists) => {
+      useApp.getState().setHasVault(exists);
+      if (exists) useApp.getState().setDialog({ kind: "vault-unlock" });
+    });
+  }, []);
 
   // Stream terminal output into the active TermView via Tauri events.
   useEffect(() => {
@@ -110,6 +128,26 @@ export default function App() {
         <div className="sidebar-head">
           <span className="logo"><Icon.Terminal /></span>
           <span className="brand">RINA</span>
+          <span style={{ flex: 1 }} />
+          <button
+            className="icon-btn"
+            title={hasVault ? (vaultLocked ? "Vault locked" : "Vault unlocked — click to lock") : "Create vault"}
+            onClick={() => {
+              if (!hasVault) setDialog({ kind: "vault-create", recoveryKey: "" });
+              else if (vaultLocked) setDialog({ kind: "vault-unlock" });
+              else ipc.vaultLock();
+            }}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="5" y="11" width="14" height="10" rx="2" />
+              <path d="M8 11V7a4 4 0 018 0v4" />
+              {hasVault && !vaultLocked && <path d="M12 15v2" />}
+            </svg>
+          </button>
+          <button className="icon-btn" title="New host"
+                  onClick={() => setDialog({ kind: "host", host: null })}>
+            <Icon.Plus />
+          </button>
         </div>
         {sidebarOpen && (
           <>
@@ -129,6 +167,24 @@ export default function App() {
                   <span className="dot" />
                   <span className="host-label">{h.label}</span>
                   <span className="host-meta">{h.username}@{h.hostname}</span>
+                  <button className="host-act" title="Edit host"
+                          onClick={(e) => { e.stopPropagation(); setDialog({ kind: "host", host: h }); }}>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M17 3l4 4L8 20l-5 1 1-5z" />
+                    </svg>
+                  </button>
+                  <button className="host-act danger" title="Delete host"
+                          onClick={(e) => { e.stopPropagation(); setDialog({
+                            kind: "confirm", title: "Delete host",
+                            message: `Delete host "${h.label}"? This cannot be undone.`,
+                            onOk: () => { ipc.hostDelete(h.id).then((ok) => {
+                              if (ok) { useApp.getState().setHosts(useApp.getState().hosts.filter((x) => x.id !== h.id)); toast("Host deleted", "success"); }
+                            }); },
+                          }); }}>
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14" />
+                    </svg>
+                  </button>
                 </li>
               ))}
               {visible.length === 0 && (
@@ -156,6 +212,13 @@ export default function App() {
             </div>
           ))}
           <button
+            className={`tab-new${sftpOpen ? " on" : ""}`}
+            title={sftpOpen ? "Close SFTP browser" : "Open SFTP browser"}
+            onClick={toggleSftp}
+          >
+            <UIIcon.Folder />
+          </button>
+          <button
             className="tab-new"
             title="New tab"
             onClick={() => addTab({ id: newId(), hostId: null, title: "shell", connected: false })}
@@ -164,33 +227,42 @@ export default function App() {
           </button>
         </div>
 
-        <div className="terminals">
-          {tabs.length === 0 ? (
-            <div className="empty">
-              <span style={{ color: "#8b949e" }}><Icon.Terminal /></span>
-              <span className="empty-title">No open sessions</span>
-              <span className="empty-sub">Double-click a host in the sidebar to connect.</span>
-            </div>
-          ) : (
-            tabs.map((t) => (
-              <div key={t.id} className={`term-pane${t.id === activeTab ? " active" : ""}`}>
-                <TermView
-                  onData={(d) => {
-                    const sid = sessions[t.id];
-                    if (sid) ipc.write(sid, d).catch(() => {});
-                  }}
-                  onResize={(cols, rows) => {
-                    const sid = sessions[t.id];
-                    if (sid) ipc.resize(sid, cols, rows).catch(() => {});
-                  }}
-                  onOutput={(cb) => outputs.set(t.id, cb)}
-                  onClosed={(cb) => closed.set(t.id, cb)}
-                />
+        <div className="workspace">
+          <div className="terminals">
+            {tabs.length === 0 ? (
+              <div className="empty">
+                <span style={{ color: "#8b949e" }}><Icon.Terminal /></span>
+                <span className="empty-title">No open sessions</span>
+                <span className="empty-sub">Double-click a host in the sidebar to connect.</span>
               </div>
-            ))
+            ) : (
+              tabs.map((t) => (
+                <div key={t.id} className={`term-pane${t.id === activeTab ? " active" : ""}`}>
+                  <TermView
+                    onData={(d) => {
+                      const sid = sessions[t.id];
+                      if (sid) ipc.write(sid, d).catch(() => {});
+                    }}
+                    onResize={(cols, rows) => {
+                      const sid = sessions[t.id];
+                      if (sid) ipc.resize(sid, cols, rows).catch(() => {});
+                    }}
+                    onOutput={(cb) => outputs.set(t.id, cb)}
+                    onClosed={(cb) => closed.set(t.id, cb)}
+                  />
+                </div>
+              ))
+            )}
+          </div>
+          {sftpOpen && (
+            <div className="sftp-pane">
+              <SftpPanel sessionId={activeTab ? sessions[activeTab] ?? null : null} />
+            </div>
           )}
         </div>
       </div>
+      <Dialogs />
+      <Toasts />
     </div>
   );
 }

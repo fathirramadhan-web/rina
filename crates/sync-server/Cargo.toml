@@ -1,0 +1,22 @@
+[package]
+name = "rina-sync-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rina-core = { workspace = true }
+rina-sync = { workspace = true }
+
+axum = "0.8"
+tokio = { workspace = true }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+jsonwebtoken = "9"
+argon2 = { version = "0.5", features = ["password-hash"] }
+uuid = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
+base64 = { workspace = true }
+sha2 = "0.10"

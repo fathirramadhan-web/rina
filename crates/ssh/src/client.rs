@@ -79,12 +79,18 @@ pub fn fingerprint(bytes: &[u8]) -> String {
 
 /// A live SSH session.
 pub struct SshConnection {
-    pub handle: Handle<VeraHandler>,
+    /// Shared so a clone can open new channels (SFTP) without holding the
+    /// connection across awaits.
+    pub handle: std::sync::Arc<Handle<VeraHandler>>,
 }
 
 impl SshConnection {
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
+    }
+
+    pub fn clone_handle(&self) -> std::sync::Arc<Handle<VeraHandler>> {
+        self.handle.clone()
     }
 }
 
@@ -274,7 +280,7 @@ pub async fn connect(
     if !ok {
         return Err(SshError::Auth("authentication failed".into()));
     }
-    Ok(SshConnection { handle })
+    Ok(SshConnection { handle: std::sync::Arc::new(handle) })
 }
 
 fn decode_private_key(pem: &str, passphrase: Option<String>) -> Result<PrivateKey> {
