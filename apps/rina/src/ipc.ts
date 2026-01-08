@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { useApp, type Host, type AuthKind, type DirEntry } from "./store";
+import { useApp, type Host, type AuthKind, type DirEntry, type Snippet } from "./store";
 
 // Every IPC call funnels through here so an unimplemented backend command
 // surfaces as a toast instead of an unhandled rejection.
@@ -70,7 +70,46 @@ export function groupSave(id: string | null, name: string, parentId: string | nu
 }
 
 export function snippetSave(id: string | null, name: string, body: string): Promise<boolean> {
-  return call("snippet_save", { id, name, body }).then((r) => r !== null);
+  // Backend expects a single `input` struct; placeholders are derived from body.
+  return call("snippet_save", { input: { id, name, body, placeholders: [] } }).then((r) => r !== null);
+}
+
+export function snippetList(): Promise<Snippet[]> {
+  return call<Snippet[]>("snippet_list").then((r) => r ?? []);
+}
+
+export function snippetPlaceholders(snippetId: string): Promise<string[]> {
+  return call<string[]>("snippet_placeholders", { snippetId }).then((r) => r ?? []);
+}
+
+export function snippetRun(sessionId: string, snippetId: string, values: Record<string, string>): Promise<boolean> {
+  if (!sessionId) { useApp.getState().toast("No active session", "error"); return Promise.resolve(false); }
+  return call("snippet_run", { sessionId, snippetId, values }).then((r) => r !== null);
+}
+
+// Resolves a backend-emitted confirm/prompt dialog (events dialog-confirm /
+// dialog-prompt). Frontend shows a Modal and invokes this with the answer.
+export function dialogResolve(token: string, value: string): Promise<boolean> {
+  return call("dialog_resolve", { token, value }).then((r) => r !== null);
+}
+
+// Merge hosts parsed from an OpenSSH config file.
+export function sshConfigImport(path: string): Promise<Host[]> {
+  return call<Host[]>("ssh_config_import", { path }).then((r) => r ?? []);
+}
+
+export function forwardLocal(sessionId: string, listenPort: number, targetHost: string, targetPort: number): Promise<boolean> {
+  return call("forward_local", { sessionId, listenPort, targetHost, targetPort }).then((r) => r !== null);
+}
+
+export function forwardStop(sessionId: string, listenPort: number): Promise<boolean> {
+  return call("forward_stop", { sessionId, listenPort }).then((r) => r !== null);
+}
+
+// Recursive directory delete (folders). sftpDelete handles files.
+export function sftpDeleteDir(sessionId: string, path: string): Promise<boolean> {
+  if (!sid(sessionId)) return Promise.resolve(false);
+  return call("sftp_delete_dir", { sessionId, path }).then((r) => r !== null);
 }
 
 export function snippetDelete(snippetId: string): Promise<boolean> {

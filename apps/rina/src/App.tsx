@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useApp, type Tab } from "./store";
 import { TermView } from "./TermView";
-import { Dialogs, Toasts, SftpPanel, Icon as UIIcon } from "./ui";
+import { Dialogs, Toasts, SftpPanel, Icon as UIIcon, SnippetPanel, ForwardDialog } from "./ui";
 import * as ipc from "./ipc";
 
 // SVG icon set — no icon-font dependency, no decorative text.
@@ -58,6 +58,7 @@ export default function App() {
   const { setHosts, addTab, removeTab, setActiveTab, toggleSidebar } = useApp();
   const [filter, setFilter] = useState("");
   const [sessions, setSessions] = useState<Record<string, string>>({}); // tabId -> sessionId
+  const [forwardOpen, setForwardOpen] = useState(false);
 
   // Load hosts from the Rust backend on mount.
   useEffect(() => {
@@ -89,6 +90,9 @@ export default function App() {
     return () => unlisten?.();
   }, []);
 
+  // Load snippets on mount; SnippetPanel refreshes on open.
+  useEffect(() => { ipc.snippetList().then((list) => useApp.getState().setSnippets(list)); }, []);
+
   const openHost = useCallback(
     async (hostId: string, label: string) => {
       const tabId = newId();
@@ -117,6 +121,8 @@ export default function App() {
     [sessions, removeTab]
   );
 
+  const activeSession = activeTab ? sessions[activeTab] ?? null : null;
+
   const visible = useMemo(
     () => hosts.filter((h) => (h.label + h.hostname + h.username).toLowerCase().includes(filter.toLowerCase())),
     [hosts, filter]
@@ -143,6 +149,10 @@ export default function App() {
               <path d="M8 11V7a4 4 0 018 0v4" />
               {hasVault && !vaultLocked && <path d="M12 15v2" />}
             </svg>
+          </button>
+          <button className="icon-btn" title="Import SSH config"
+                  onClick={() => setDialog({ kind: "ssh-import" })}>
+            <UIIcon.Upload />
           </button>
           <button className="icon-btn" title="New host"
                   onClick={() => setDialog({ kind: "host", host: null })}>
@@ -220,6 +230,20 @@ export default function App() {
           </button>
           <button
             className="tab-new"
+            title="Run snippet (Ctrl+K)"
+            onClick={() => useApp.getState().toggleSnippetPanel()}
+          >
+            <UIIcon.Bolt />
+          </button>
+          <button
+            className={`tab-new${forwardOpen ? " on" : ""}`}
+            title="Port forwarding"
+            onClick={() => setForwardOpen(true)}
+          >
+            <UIIcon.Globe />
+          </button>
+          <button
+            className="tab-new"
             title="New tab"
             onClick={() => addTab({ id: newId(), hostId: null, title: "shell", connected: false })}
           >
@@ -256,11 +280,13 @@ export default function App() {
           </div>
           {sftpOpen && (
             <div className="sftp-pane">
-              <SftpPanel sessionId={activeTab ? sessions[activeTab] ?? null : null} />
+              <SftpPanel sessionId={activeSession} />
             </div>
           )}
         </div>
       </div>
+      <SnippetPanel sessionId={activeSession} />
+      {forwardOpen && <ForwardDialog sessionId={activeSession} onClose={() => setForwardOpen(false)} />}
       <Dialogs />
       <Toasts />
     </div>

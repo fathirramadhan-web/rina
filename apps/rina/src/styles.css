@@ -251,3 +251,28 @@ button { font: inherit; cursor: pointer; }
 
 .tab-new.on { color: #58a6ff; }
 .tab-new.on:hover { color: #79b8ff; }
+
+/* ---------- snippet palette + forward dialog ---------- */
+.palette-list { flex: 1; overflow-y: auto; margin-top: 8px; }
+.palette-row {
+  display: flex; align-items: center; gap: 4px;
+  border-bottom: 1px solid #21262d;
+}
+.palette-row:last-child { border-bottom: none; }
+.palette-pick {
+  flex: 1; display: flex; align-items: center; gap: 10px;
+  background: none; border: none; color: #e6edf3; text-align: left;
+  padding: 10px 8px; font-size: 13px;
+}
+.palette-pick svg { color: #8b949e; flex: 0 0 auto; }
+.palette-pick:hover { background: #21262d; color: #3fb950; }
+.palette-pick:hover svg { color: #3fb950; }
+.section-label {
+  margin: 0 0 10px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: .5px; color: #8b949e; font-weight: 600;
+}
+.link-btn {
+  background: none; border: none; color: #58a6ff; font-size: 12px;
+  padding: 0; cursor: pointer;
+}
+.link-btn:hover { color: #79b8ff; }

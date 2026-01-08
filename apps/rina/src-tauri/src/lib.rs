@@ -7,7 +7,6 @@ use async_trait::async_trait;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 use rina_core::crypto::{KdfParams, SecretKey};
 use rina_core::db::Db;
@@ -17,6 +16,8 @@ use rina_core::models::{
 use rina_core::vault::{self, UnlockedKeys};
 use rina_ssh::client::{AuthMethod, ConnectConfig, HostKeyInfo, HostKeyStore, Interaction};
 use rina_ssh::shell::{open_shell, ShellEvent, ShellHandle, ShellOptions};
+
+mod sync;
 
 /// Minimal host JSON the frontend expects (see src/store.ts). Exactly 7 keys,
 /// `group_id` spelled with an underscore.
@@ -124,33 +125,103 @@ impl HostKeyStore for SqliteHostKeyStore {
     }
 }
 
-/// SSH prompts surfaced as native dialogs.
+/// Custom-dialog bridge replacing tauri-plugin-dialog. The backend emits a
+/// `dialog-confirm` / `dialog-prompt` event carrying a unique token, then waits
+/// on a oneshot channel; the frontend modal calls `dialog_resolve` with that
+/// token to complete it.
 ///
-/// ponytail: tauri-plugin-dialog 2.x has only file + yes/no message dialogs —
-/// no text-input prompt. `password`/`kbd_prompt` therefore fail with a clear
-/// error; store a credential in the vault instead of prompting. Upgrade path:
-/// swap in a text-input capable dialog (or a frontend prompt over IPC).
-struct RinaInteraction {
+/// ponytail: one shared waiter map keyed by token covers confirm + prompt, so
+/// concurrent dialogs can't collide. Add per-dialog timeouts here if a modal can
+/// ever be dismissed without answering.
+#[derive(Clone, Default)]
+struct DialogWaiters(Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<String>>>>);
+
+struct DialogBridge {
     app: AppHandle,
+    waiters: DialogWaiters,
 }
 
-const NO_TEXT_PROMPT: &str = "no interactive text prompt available: store a password \
-     or key credential in the vault and unlock it before connecting";
+/// Open a token→answer channel, emit the dialog event, await the answer.
+/// The std-Mutex guard is dropped before awaiting (never held across `.await`).
+async fn ask(
+    bridge: &DialogBridge,
+    event: &str,
+    title: String,
+    message: String,
+    extra: serde_json::Value,
+) -> rina_ssh::Result<String> {
+    let token = new_id();
+    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    bridge
+        .waiters
+        .0
+        .lock()
+        .map_err(|_| rina_ssh::SshError::Connect("dialog waiter lock poisoned".into()))?
+        .insert(token.clone(), tx);
 
-#[async_trait]
-impl Interaction for RinaInteraction {
-    async fn password(&self, _prompt: &str) -> rina_ssh::Result<String> {
-        Err(rina_ssh::SshError::Auth(NO_TEXT_PROMPT.into()))
+    let payload = serde_json::json!({
+        "token": token,
+        "title": title,
+        "message": message,
+    });
+    // Merge `extra` (danger / kind) into the flat payload the frontend expects.
+    let payload = match (payload, extra) {
+        (serde_json::Value::Object(mut base), serde_json::Value::Object(rest)) => {
+            for (k, v) in rest {
+                base.insert(k, v);
+            }
+            serde_json::Value::Object(base)
+        }
+        (base, _) => base,
+    };
+
+    if bridge.app.emit(event, payload).is_err() {
+        // Nobody is listening (window gone): fail the connect instead of hanging.
+        bridge.waiters.0.lock().ok().map(|mut m| m.remove(&token));
+        return Err(rina_ssh::SshError::Connect(format!(
+            "failed to emit {event}: no dialog surface"
+        )));
     }
 
-    async fn kbd_prompt(&self, _name: &str, _instruction: &str, _prompt: &str) -> rina_ssh::Result<String> {
-        Err(rina_ssh::SshError::Auth(NO_TEXT_PROMPT.into()))
+    match rx.await {
+        Ok(answer) => Ok(answer),
+        Err(_) => {
+            // dialog_resolve never arrived (sender dropped).
+            Err(rina_ssh::SshError::Connect("dialog cancelled".into()))
+        }
+    }
+}
+
+#[async_trait]
+impl Interaction for DialogBridge {
+    async fn password(&self, prompt: &str) -> rina_ssh::Result<String> {
+        let answer = ask(
+            self,
+            "dialog-prompt",
+            "SSH authentication".into(),
+            prompt.to_string(),
+            serde_json::json!({ "kind": "password", "secret": true }),
+        )
+        .await?;
+        Ok(answer)
+    }
+
+    async fn kbd_prompt(&self, _name: &str, _instruction: &str, prompt: &str) -> rina_ssh::Result<String> {
+        ask(
+            self,
+            "dialog-prompt",
+            "SSH authentication".into(),
+            prompt.to_string(),
+            serde_json::json!({ "kind": "otp", "secret": true }),
+        )
+        .await
     }
 
     async fn accept_host_key(&self, info: &HostKeyInfo, changed: bool) -> rina_ssh::Result<bool> {
-        // First use: trust is the affirmative default. Changed key: reject is
-        // the affirmative default; silent accept would hide a MITM.
-        let (title, message, kind, ok_label, cancel_label) = if changed {
+        // First use: trust is the affirmative ask (danger=false). Changed key:
+        // danger=true, and acceptance still requires an explicit OK, so reject
+        // stays the safe default against a silent MITM.
+        let (title, message, danger) = if changed {
             (
                 "Host key CHANGED",
                 format!(
@@ -161,9 +232,7 @@ impl Interaction for RinaInteraction {
                     info.fingerprint,
                     info.key_type
                 ),
-                MessageDialogKind::Warning,
-                "Reject (safe)",
-                "Accept anyway",
+                true,
             )
         } else {
             (
@@ -175,31 +244,19 @@ impl Interaction for RinaInteraction {
                     info.fingerprint,
                     info.key_type
                 ),
-                MessageDialogKind::Info,
-                "Trust and remember",
-                "Reject",
+                false,
             )
         };
 
-        let builder = self
-            .app
-            .dialog()
-            .message(message)
-            .title(title)
-            .kind(kind)
-            .buttons(MessageDialogButtons::OkCancelCustom(
-                ok_label.to_string(),
-                cancel_label.to_string(),
-            ));
-
-        // blocking_show must not run on the main thread; commands run on the
-        // async runtime, so park it on a blocking thread.
-        let ok_pressed = tokio::task::spawn_blocking(move || builder.blocking_show())
-            .await
-            .map_err(|e| rina_ssh::SshError::Connect(format!("host key dialog: {e}")))?;
-
-        // OK button = Reject on a changed key, Trust on first use.
-        Ok(if changed { !ok_pressed } else { ok_pressed })
+        let answer = ask(
+            self,
+            "dialog-confirm",
+            title.into(),
+            message,
+            serde_json::json!({ "danger": danger }),
+        )
+        .await?;
+        Ok(answer == "yes")
     }
 }
 
@@ -239,6 +296,11 @@ struct Session {
 }
 
 type SessionMap = Mutex<HashMap<String, Session>>;
+
+/// Registry of running local port-forwards, keyed by (session_id, listen_port).
+/// `forward_stop` aborts the accept-loop task and the registry drops the entry,
+/// closing the listener socket.
+type ForwardMap = Arc<Mutex<HashMap<(String, u16), tokio::task::JoinHandle<()>>>>;
 
 // ---- vault commands ----
 
@@ -514,7 +576,10 @@ async fn connect_host(
         keepalive_secs: host.options.keepalive_seconds.max(1) as u64,
     };
 
-    let interaction: Arc<dyn Interaction> = Arc::new(RinaInteraction { app: app.clone() });
+    let interaction: Arc<dyn Interaction> = Arc::new(DialogBridge {
+        app: app.clone(),
+        waiters: app.state::<DialogWaiters>().inner().clone(),
+    });
     let conn = rina_ssh::client::connect(&cfg, auth, interaction, store.inner().clone())
         .await
         .map_err(|e| e.to_string())?;
@@ -572,6 +637,232 @@ async fn session_resize(app: AppHandle, session_id: String, cols: u32, rows: u32
     let s = map.get(&session_id).ok_or_else(|| format!("no session {session_id}"))?;
     s.shell.resize(cols, rows);
     Ok(())
+}
+
+#[derive(Serialize)]
+struct SnippetJson {
+    id: String,
+    name: String,
+    body: String,
+    placeholders: Vec<String>,
+}
+
+#[tauri::command]
+async fn snippet_list(db: State<'_, DbHandle>) -> Result<Vec<SnippetJson>, String> {
+    Ok(db
+        .with(|d| d.list_snippets())?
+        .into_iter()
+        .map(|s| SnippetJson {
+            id: s.id,
+            name: s.name,
+            body: s.body,
+            placeholders: s.placeholders,
+        })
+        .collect())
+}
+
+/// Scan `{{ name }}` tokens in first-seen order, deduped.
+fn scan_placeholders(body: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("{{") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else { break };
+        let name = after[..end].trim();
+        if !name.is_empty() && !out.iter().any(|p| p == name) {
+            out.push(name.to_string());
+        }
+        rest = &after[end + 2..];
+    }
+    out
+}
+
+/// Replace `{{ name }}` tokens that have a supplied value; unknown tokens stay
+/// verbatim so the user can see what was left unfilled.
+fn substitute_placeholders(body: &str, values: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(start) = rest.find("{{") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("}}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let raw = &after[..end];
+        match values.get(raw.trim()) {
+            Some(v) => out.push_str(v),
+            None => {
+                out.push_str("{{");
+                out.push_str(raw);
+                out.push_str("}}");
+            }
+        }
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[tauri::command]
+async fn snippet_placeholders(db: State<'_, DbHandle>, snippet_id: String) -> Result<Vec<String>, String> {
+    let snippet = db
+        .with(|d| d.list_snippets())?
+        .into_iter()
+        .find(|s| s.id == snippet_id)
+        .ok_or_else(|| format!("no snippet {snippet_id}"))?;
+    Ok(scan_placeholders(&snippet.body))
+}
+
+#[tauri::command]
+async fn snippet_run(
+    app: AppHandle,
+    db: State<'_, DbHandle>,
+    session_id: String,
+    snippet_id: String,
+    values: HashMap<String, String>,
+) -> Result<String, String> {
+    let snippet = db
+        .with(|d| d.list_snippets())?
+        .into_iter()
+        .find(|s| s.id == snippet_id)
+        .ok_or_else(|| format!("no snippet {snippet_id}"))?;
+    let command = substitute_placeholders(&snippet.body, &values);
+
+    let sessions = app.state::<SessionMap>();
+    let map = sessions.lock().map_err(|_| "session lock")?;
+    let s = map.get(&session_id).ok_or_else(|| format!("no session {session_id}"))?;
+    if !s.shell.write(command.as_bytes()) {
+        return Err("session shell closed".to_string());
+    }
+    Ok(command)
+}
+
+// ---- ssh_config import ----
+
+#[tauri::command]
+async fn ssh_config_import(
+    app: AppHandle,
+    db: State<'_, DbHandle>,
+    path: String,
+) -> Result<Vec<HostJson>, String> {
+    let home = app.path().home_dir().ok();
+    let expanded = match path.strip_prefix("~/") {
+        Some(rest) => {
+            let base = home
+                .as_ref()
+                .ok_or_else(|| "cannot resolve ~: home directory unavailable".to_string())?;
+            base.join(rest)
+        }
+        None => std::path::PathBuf::from(&path),
+    };
+    let content = tokio::fs::read_to_string(&expanded)
+        .await
+        .map_err(|e| format!("read ssh config {}: {e}", expanded.display()))?;
+    let parsed = rina_core::sshconfig::parse(&content, home.as_deref());
+    let hosts = rina_core::sshconfig::into_hosts(&parsed);
+    for h in &hosts {
+        db.with(|d| d.upsert_host(h))?;
+    }
+    Ok(hosts.iter().map(HostJson::from).collect())
+}
+
+#[tauri::command]
+async fn dialog_resolve(app: AppHandle, token: String, value: String) -> Result<(), String> {
+    let waiters = app.state::<DialogWaiters>();
+    let mut map = waiters.0.lock().map_err(|_| "dialog waiter lock poisoned".to_string())?;
+    if let Some(tx) = map.remove(&token) {
+        let _ = tx.send(value);
+    }
+    Ok(())
+}
+
+// ---- local port forwarding ----
+
+#[tauri::command]
+async fn forward_local(
+    app: AppHandle,
+    session_id: String,
+    listen_port: u16,
+    target_host: String,
+    target_port: u16,
+) -> Result<(), String> {
+    let sessions = app.state::<SessionMap>();
+    let handle = {
+        let map = sessions.lock().map_err(|_| "session lock".to_string())?;
+        map.get(&session_id)
+            .ok_or_else(|| format!("no session {session_id}"))?
+            ._conn
+            .clone_handle()
+    };
+
+    // Bind before registering: a bind failure returns a clear error and leaves
+    // no stale registry entry.
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen_port))
+        .await
+        .map_err(|e| format!("cannot bind 127.0.0.1:{listen_port}: {e}"))?;
+
+    let forwards = app.state::<ForwardMap>().inner().clone();
+    let key = (session_id, listen_port);
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut tcp, _peer) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    tracing::warn!("forward accept on {listen_port}: {e}");
+                    break;
+                }
+            };
+            let h = handle.clone();
+            let host = target_host.clone();
+            let port = target_port;
+            tokio::spawn(async move {
+                match h
+                    .channel_open_direct_tcpip(host.clone(), port as u32, "127.0.0.1", 0)
+                    .await
+                {
+                    Ok(channel) => {
+                        let mut stream = channel.into_stream();
+                        let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+                    }
+                    Err(e) => tracing::warn!("direct-tcpip {host}:{port}: {e}"),
+                }
+            });
+        }
+    });
+
+    let mut map = forwards.lock().map_err(|_| "forward lock poisoned".to_string())?;
+    if let Some(old) = map.insert(key, task) {
+        old.abort();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn forward_stop(app: AppHandle, session_id: String, listen_port: u16) -> Result<(), String> {
+    let forwards = app.state::<ForwardMap>();
+    let mut map = forwards.lock().map_err(|_| "forward lock poisoned".to_string())?;
+    if let Some(task) = map.remove(&(session_id, listen_port)) {
+        task.abort();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn placeholder_scan_and_substitute() {
+        let body = "echo {{host}} {{ user }} {{host}} {{}} {{unclosed";
+        let found = scan_placeholders(body);
+        assert_eq!(found, vec!["host", "user"]);
+        let values = HashMap::from([("host".to_string(), "box".to_string())]);
+        assert_eq!(
+            substitute_placeholders(body, &values),
+            "echo box {{ user }} box {{}} {{unclosed"
+        );
+    }
 }
 
 #[tauri::command]
@@ -649,6 +940,12 @@ async fn sftp_download(app: AppHandle, session_id: String, remote_path: String) 
 }
 
 #[tauri::command]
+async fn sftp_delete_dir(app: AppHandle, session_id: String, path: String) -> Result<(), String> {
+    let s = open_sftp(&app, &session_id).await?;
+    sftp_map(s.remove_dir(&path).await)
+}
+
+#[tauri::command]
 async fn sftp_upload(app: AppHandle, session_id: String, remote_path: String, data: Vec<u8>) -> Result<(), String> {
     let s = open_sftp(&app, &session_id).await?;
     s.write_file(&remote_path, &data).await.map_err(|e| e.to_string())
@@ -657,7 +954,6 @@ async fn sftp_upload(app: AppHandle, session_id: String, remote_path: String, da
 pub fn run() {
     tracing_subscriber::fmt().try_init().ok();
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -668,6 +964,9 @@ pub fn run() {
             app.manage(store);
             app.manage(VaultHandle::default());
             app.manage(SessionMap::default());
+            app.manage(ForwardMap::default());
+            app.manage(DialogWaiters::default());
+            app.manage(sync::SyncHandle::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -686,14 +985,30 @@ pub fn run() {
             group_save,
             snippet_save,
             snippet_delete,
+            snippet_list,
+            snippet_placeholders,
+            snippet_run,
             credential_save,
+            ssh_config_import,
+            dialog_resolve,
+            forward_local,
+            forward_stop,
             sftp_list,
             sftp_mkdir,
             sftp_delete,
+            sftp_delete_dir,
             sftp_rename,
             sftp_chmod,
             sftp_download,
             sftp_upload,
+            sync::sync_register,
+            sync::sync_login,
+            sync::sync_now,
+            sync::sync_status,
+            sync::sync_logout,
+            sync::sync_devices,
+            sync::sync_revoke_device,
+            sync::sync_set_url,
         ])
         .run(tauri::generate_context!())
         .expect("tauri run");

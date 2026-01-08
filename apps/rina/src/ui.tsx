@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useApp, type Host, type AuthKind, type DirEntry } from "./store";
+import { listen } from "@tauri-apps/api/event";
+import { useApp, type Host, type AuthKind, type DirEntry, type Snippet, type Forward } from "./store";
 import * as ipc from "./ipc";
 
 // ---- inline SVG icons (no icon font, no emoji) ----
@@ -24,6 +25,10 @@ export const Icon = {
   Lock: () => <S d={["M5 11h14v10H5z", "M8 11V7a4 4 0 018 0v4"]} />,
   Check: () => <S d="M4 12l5 5L20 6" />,
   Refresh: () => <S d={["M21 12a9 9 0 11-3-6.7", "M21 3v6h-6"]} />,
+  Bolt: () => <S d="M13 2L4 14h7l-1 8 9-12h-7z" />,
+  Upload: () => <S d={["M12 16V4", "M7 9l5-5 5 5", "M4 17v3h16v-3"]} />,
+  Globe: () => <S d={["M12 3a9 9 0 100 18 9 9 0 000-18z", "M3 12h18", "M12 3c3 3 3 15 0 18", "M12 3c-3 3-3 15 0 18"]} />,
+  ChevronDown: () => <S d={["M6 9l6 6 6-6"]} />,
 };
 
 // ---- generic modal shell ----
@@ -244,7 +249,125 @@ export function Dialogs() {
       <ConfirmDialog />
       <HostDialog />
       <VaultDialog />
+      <BackendDialog />
+      <SshImportDialog />
     </>
+  );
+}
+
+// ---- custom replacement for native Tauri dialogs ----
+// Backend emits dialog-confirm { token, title, message, danger } and
+// dialog-prompt { token, title, message, kind }. Frontend renders a Modal and
+// invokes dialog_resolve with the answer; each event has its own token so
+// concurrent prompts don't collide.
+type BackendPrompt =
+  | { token: string; title: string; message: string; danger: boolean; kind: "confirm"; placeholder?: undefined; secret?: undefined }
+  | { token: string; title: string; message: string; danger: false; kind: "prompt"; placeholder?: string; secret?: boolean }
+  | null;
+
+function BackendDialog() {
+  const [queue, setQueue] = useState<NonNullable<BackendPrompt>[]>([]);
+  const [value, setValue] = useState("");
+  const waiters = useRef(new Map<string, (answer: string) => void>());
+
+  useEffect(() => {
+    // Each event registers a promise keyed by token; answering resolves it,
+    // which sends dialog_resolve only for that token.
+    const enqueue = (p: NonNullable<BackendPrompt>) => {
+      const done = new Promise<string>((resolve) => { waiters.current.set(p.token, resolve); });
+      done
+        .then((answer) => { ipc.dialogResolve(p.token, answer).catch(() => {}); })
+        .finally(() => { waiters.current.delete(p.token); });
+      setQueue((q) => [...q, p]);
+    };
+    let unConfirm: (() => void) | undefined, unPrompt: (() => void) | undefined;
+    listen<{ token: string; title: string; message: string; danger?: boolean }>(
+      "dialog-confirm",
+      (e) => enqueue({ ...e.payload, danger: e.payload.danger === true, kind: "confirm" }),
+    ).then((u) => (unConfirm = u));
+    listen<{ token: string; title: string; message: string; kind: string }>(
+      "dialog-prompt",
+      (e) => enqueue({ ...e.payload, danger: false, kind: "prompt" }),
+    ).then((u) => (unPrompt = u));
+    return () => { unConfirm?.(); unPrompt?.(); };
+  }, []);
+
+  const prompt = queue[0] ?? null;
+  if (!prompt) return null;
+  const answer = (v: string) => {
+    waiters.current.get(prompt.token)?.(v);
+    setQueue((q) => q.slice(1));
+    setValue("");
+  };
+
+  return (
+    <Modal title={prompt.title} onClose={() => answer("")}
+      footer={
+        <>
+          <button className="btn" onClick={() => answer("")}>Cancel</button>
+          {prompt.kind === "confirm" ? (
+            <button className={prompt.danger ? "btn danger" : "btn primary"} onClick={() => answer("yes")}>OK</button>
+          ) : (
+            <button className="btn primary" onClick={() => answer(value)}><Icon.Check /> OK</button>
+          )}
+        </>
+      }>
+      <p className="confirm-msg">{prompt.message}</p>
+      {prompt.kind === "prompt" && (
+        <div className="form-grid" style={{ marginTop: 12 }}>
+          <label className="span2">
+            <input
+              autoFocus
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") answer(value); }}
+              placeholder={prompt.placeholder ?? ""}
+            />
+          </label>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// ---- SSH config import (sidebar footer button) ----
+function SshImportDialog() {
+  const dialog = useApp((s) => s.dialog);
+  const setDialog = useApp((s) => s.setDialog);
+  const toast = useApp((s) => s.toast);
+  const [path, setPath] = useState("~/.ssh/config");
+  if (!dialog || dialog.kind !== "ssh-import") return null;
+  const close = () => setDialog(null);
+
+  const submit = async () => {
+    const p = path.trim();
+    if (!p) { toast("Enter a config path", "error"); return; }
+    const hosts = await ipc.sshConfigImport(p);
+    if (hosts.length === 0) { toast("No hosts found", "info"); close(); return; }
+    const existing = useApp.getState().hosts;
+    const byId = new Map(existing.map((h) => [h.id, h]));
+    for (const h of hosts) byId.set(h.id, h);
+    useApp.getState().setHosts([...byId.values()]);
+    toast(`Imported ${hosts.length} host${hosts.length === 1 ? "" : "s"}`, "success");
+    close();
+  };
+
+  return (
+    <Modal title="Import SSH config" onClose={close}
+      footer={
+        <>
+          <button className="btn" onClick={close}>Cancel</button>
+          <button className="btn primary" onClick={submit}><Icon.Check /> Import</button>
+        </>
+      }>
+      <div className="form-grid">
+        <label className="span2">Config path
+          <input value={path} autoFocus onChange={(e) => setPath(e.target.value)}
+                 onKeyDown={(e) => { if (e.key === "Enter") submit(); }}
+                 placeholder="~/.ssh/config" />
+        </label>
+      </div>
+    </Modal>
   );
 }
 
@@ -361,7 +484,12 @@ export function SftpPanel({ sessionId }: { sessionId: string | null }) {
                 onClick={() => selPath && setDialog({
                   kind: "confirm", title: "Delete remote item",
                   message: `Delete "${sftp.selected}"? This cannot be undone.`,
-                  onOk: () => { ipc.sftpDelete(sessionId ?? "", selPath!).then(refresh); },
+                  onOk: () => {
+                // sftpDeleteDir handles folders, sftpDelete handles files.
+                const isDir = (sftp.entries.find((e) => e.name === sftp.selected)?.is_dir) ?? false;
+                const del = isDir ? ipc.sftpDeleteDir : ipc.sftpDelete;
+                del(sessionId ?? "", selPath!).then(refresh);
+              },
                 })} disabled={!selPath}><Icon.Trash /></button>
         <input ref={fileRef} type="file" multiple hidden onChange={(e) => { onUpload(e.target.files); e.target.value = ""; }} />
       </div>
@@ -404,6 +532,186 @@ export function SftpPanel({ sessionId }: { sessionId: string | null }) {
         </Modal>
       )}
     </div>
+  );
+}
+
+// ---- snippet runner / command palette (Ctrl+K) ----
+export function SnippetPanel({ sessionId }: { sessionId: string | null }) {
+  const open = useApp((s) => s.snippetPanelOpen);
+  const toggle = useApp((s) => s.toggleSnippetPanel);
+  const snippets = useApp((s) => s.snippets);
+  const setSnippets = useApp((s) => s.setSnippets);
+  const toast = useApp((s) => s.toast);
+  const setDialog = useApp((s) => s.setDialog);
+  const [filter, setFilter] = useState("");
+  const [selected, setSelected] = useState<Snippet | null>(null);
+  const [values, setValues] = useState<Record<string, string>>({});
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newBody, setNewBody] = useState("");
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        toggle();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [toggle]);
+
+  useEffect(() => {
+    if (open) ipc.snippetList().then(setSnippets);
+  }, [open, setSnippets]);
+
+  const pick = async (s: Snippet) => {
+    setSelected(s);
+    // Backend scans placeholders from body; fall back to the stored field.
+    const ph = (await ipc.snippetPlaceholders(s.id)) ?? s.placeholders ?? [];
+    setValues(Object.fromEntries(ph.map((p) => [p, ""])));
+  };
+
+  const run = async () => {
+    if (!selected || !sessionId) return;
+    const ok = await ipc.snippetRun(sessionId, selected.id, values);
+    if (ok) { toast("Snippet sent", "success"); toggle(); }
+  };
+
+  const create = async () => {
+    if (!newName.trim() || !newBody.trim()) { toast("Name and body required", "error"); return; }
+    const ok = await ipc.snippetSave(null, newName.trim(), newBody);
+    if (!ok) return;
+    ipc.snippetList().then(setSnippets);
+    setCreating(false);
+    setNewName("");
+    setNewBody("");
+    toast("Snippet created", "success");
+  };
+
+  if (!open) return null;
+  const visible = snippets.filter((s) => s.name.toLowerCase().includes(filter.toLowerCase()));
+
+  return (
+    <Modal title="Run snippet" onClose={toggle} wide
+      footer={
+        <>
+          {!creating && <button className="btn" onClick={() => setCreating(true)}><Icon.Plus /> New</button>}
+          {selected && !creating && (
+            <button className="btn primary" onClick={run} disabled={!sessionId}><Icon.Bolt /> Run</button>
+          )}
+          {creating && (
+            <>
+              <button className="btn" onClick={() => setCreating(false)}>Cancel</button>
+              <button className="btn primary" onClick={create}><Icon.Check /> Save</button>
+            </>
+          )}
+        </>
+      }>
+      {creating ? (
+        <div className="form-grid">
+          <label className="span2">Name<input value={newName} autoFocus onChange={(e) => setNewName(e.target.value)} placeholder="deploy status" /></label>
+          <label className="span2">Body (use {"{{name}}"} for placeholders)
+            <textarea rows={5} value={newBody} onChange={(e) => setNewBody(e.target.value)} placeholder="kubectl get pods -n {{namespace}}" />
+          </label>
+        </div>
+      ) : selected ? (
+        <>
+          <button className="link-btn" onClick={() => setSelected(null)}>← All snippets</button>
+          <p className="confirm-msg" style={{ marginTop: 8 }}>{selected.name}</p>
+          {Object.keys(values).length === 0 ? (
+            <p className="form-hint">No placeholders.</p>
+          ) : (
+            <div className="form-grid" style={{ marginTop: 12 }}>
+              {Object.keys(values).map((p) => (
+                <label key={p}>{p}
+                  <input value={values[p] ?? ""} onChange={(e) => setValues((v) => ({ ...v, [p]: e.target.value }))} autoFocus={p === Object.keys(values)[0]} />
+                </label>
+              ))}
+            </div>
+          )}
+        </>
+      ) : (
+        <>
+          <input className="sidebar-search" style={{ width: "100%" }} placeholder="Filter snippets" value={filter} onChange={(e) => setFilter(e.target.value)} autoFocus />
+          <div className="palette-list">
+            {visible.length === 0 ? (
+              <div className="sftp-empty">
+                No snippets yet.
+                <div><button className="btn" onClick={() => setCreating(true)}><Icon.Plus /> Create snippet</button></div>
+              </div>
+            ) : visible.map((s) => (
+              <div key={s.id} className="palette-row">
+                <button className="palette-pick" onClick={() => pick(s)}>
+                  <Icon.Bolt /> <span>{s.name}</span>
+                </button>
+                <button className="icon-btn danger" title="Delete snippet" onClick={() => {
+                  setDialog({
+                    kind: "confirm", title: "Delete snippet",
+                    message: `Delete snippet "${s.name}"?`,
+                    onOk: () => { ipc.snippetDelete(s.id).then(() => ipc.snippetList().then(setSnippets)); },
+                  });
+                }}><Icon.Trash /></button>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
+
+// ---- port forwarding ----
+export function ForwardDialog({ sessionId, onClose }: { sessionId: string | null; onClose: () => void }) {
+  const forwards = useApp((s) => s.forwards);
+  const addForward = useApp((s) => s.addForward);
+  const removeForward = useApp((s) => s.removeForward);
+  const toast = useApp((s) => s.toast);
+  const [form, setForm] = useState({ listenPort: "8080", targetHost: "127.0.0.1", targetPort: "80" });
+  const active = sessionId ? (forwards[sessionId] ?? []) : [];
+
+  const add = async () => {
+    const lp = Number(form.listenPort), tp = Number(form.targetPort);
+    if (!sessionId) { toast("No active session", "error"); return; }
+    if (![lp, tp].every((n) => Number.isInteger(n) && n >= 1 && n <= 65535)) { toast("Ports must be 1-65535", "error"); return; }
+    const ok = await ipc.forwardLocal(sessionId, lp, form.targetHost.trim(), tp);
+    if (!ok) return;
+    addForward(sessionId, { listenPort: lp, targetHost: form.targetHost.trim(), targetPort: tp });
+    toast("Forward added", "success");
+  };
+
+  const stop = async (f: Forward) => {
+    if (!sessionId) return;
+    const ok = await ipc.forwardStop(sessionId, f.listenPort);
+    if (ok) removeForward(sessionId, f.listenPort);
+  };
+
+  return (
+    <Modal title="Port forwarding" onClose={onClose}
+      footer={<button className="btn" onClick={onClose}>Close</button>}>
+      <h4 className="section-label">Add local forward</h4>
+      <div className="form-grid">
+        <label>Listen port<input value={form.listenPort} inputMode="numeric" onChange={(e) => setForm({ ...form, listenPort: e.target.value })} /></label>
+        <label>Target host<input value={form.targetHost} onChange={(e) => setForm({ ...form, targetHost: e.target.value })} /></label>
+        <label>Target port<input value={form.targetPort} inputMode="numeric" onChange={(e) => setForm({ ...form, targetPort: e.target.value })} /></label>
+      </div>
+      <div style={{ marginTop: 12, textAlign: "right" }}>
+        <button className="btn primary" onClick={add}><Icon.Plus /> Add</button>
+      </div>
+      <h4 className="section-label" style={{ marginTop: 18 }}>Active forwards</h4>
+      {!sessionId ? <p className="form-hint">No active session.</p> : active.length === 0 ? (
+        <p className="form-hint">No forwards for this session.</p>
+      ) : (
+        <div className="palette-list">
+          {active.map((f) => (
+            <div key={f.listenPort} className="palette-row">
+              <span className="palette-pick">:{f.listenPort} → {f.targetHost}:{f.targetPort}</span>
+              <button className="icon-btn danger" title="Stop forward" onClick={() => stop(f)}><Icon.Close size={14} /></button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
   );
 }
 

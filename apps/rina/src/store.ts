@@ -29,12 +29,26 @@ export interface DirEntry {
   size: number;
 }
 
+export interface Snippet {
+  id: string;
+  name: string;
+  body: string;
+  placeholders: string[];
+}
+
+export interface Forward {
+  listenPort: number;
+  targetHost: string;
+  targetPort: number;
+}
+
 // Which modal is open. Only one at a time.
 export type Dialog =
   | { kind: "host"; host: Host | null }
   | { kind: "confirm"; title: string; message: string; onOk: () => void }
   | { kind: "vault-unlock" }
-  | { kind: "vault-create"; recoveryKey: string };
+  | { kind: "vault-create"; recoveryKey: string }
+  | { kind: "ssh-import" };
 
 export interface Toast {
   id: number;
@@ -60,6 +74,13 @@ interface AppState {
   vaultLocked: boolean;
   hasVault: boolean;
   sftp: SftpState;
+  snippets: Snippet[];
+  snippetPanelOpen: boolean;
+  forwards: Record<string, Forward[]>; // sessionId -> forwards
+  setSnippets: (s: Snippet[]) => void;
+  toggleSnippetPanel: () => void;
+  addForward: (sessionId: string, f: Forward) => void;
+  removeForward: (sessionId: string, listenPort: number) => void;
   setHosts: (h: Host[]) => void;
   addTab: (t: Tab) => void;
   removeTab: (id: string) => void;
@@ -87,6 +108,17 @@ export const useApp = create<AppState>((set) => ({
   vaultLocked: false,
   hasVault: false,
   sftp: { open: false, path: "/", entries: [], loading: false, selected: null },
+  snippets: [],
+  snippetPanelOpen: false,
+  forwards: {},
+  setSnippets: (snippets) => set({ snippets }),
+  toggleSnippetPanel: () => set((s) => ({ snippetPanelOpen: !s.snippetPanelOpen })),
+  addForward: (sessionId, f) => set((s) => ({
+    forwards: { ...s.forwards, [sessionId]: [...(s.forwards[sessionId] ?? []).filter((x) => x.listenPort !== f.listenPort), f] },
+  })),
+  removeForward: (sessionId, listenPort) => set((s) => ({
+    forwards: { ...s.forwards, [sessionId]: (s.forwards[sessionId] ?? []).filter((x) => x.listenPort !== listenPort) },
+  })),
   setHosts: (hosts) => set({ hosts }),
   addTab: (t) => set((s) => ({ tabs: [...s.tabs, t], activeTab: t.id })),
   removeTab: (id) =>

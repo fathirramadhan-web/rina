@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::Serialize;
 
 use crate::error::{Error, Result};
 use crate::models::{
@@ -117,6 +118,81 @@ impl Db {
 
     pub fn has_vault(&self) -> Result<bool> {
         Ok(self.get_vault_meta()?.is_some())
+    }
+
+    // ---- generic meta (sync URL, tokens, cursor) ----
+
+    pub fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row("SELECT value FROM meta WHERE key=?1", params![key], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meta(key, value) VALUES(?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Local `updated_at` for a synced entity (tombstones included), so pull can
+    /// do last-write-wins. `kind` is a fixed whitelist, so the interpolated
+    /// table name is safe.
+    pub fn get_entity_updated_at(&self, kind: &str, id: &str) -> Result<Option<i64>> {
+        let table = match kind {
+            "host" => "hosts",
+            "group" => "groups",
+            "snippet" => "snippets",
+            "known_host" => "known_hosts",
+            other => return Err(Error::Invalid(format!("unknown sync kind: {other}"))),
+        };
+        let sql = format!("SELECT updated_at FROM {table} WHERE id=?1");
+        self.conn
+            .query_row(&sql, params![id], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// All local rows for a synced entity kind, tombstones included, as JSON.
+    /// Lets the sync client seal pushes and compute last-write-wins without
+    /// per-kind query methods. `kind` is a fixed whitelist, so the interpolated
+    /// table name is safe.
+    pub fn list_entity_json(&self, kind: &str) -> Result<Vec<serde_json::Value>> {
+        let out = match kind {
+            "host" => {
+                let mut s = self.conn.prepare("SELECT * FROM hosts")?;
+                let rows: Vec<Host> = s
+                    .query_map([], host_from_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                to_json_values(rows)?
+            }
+            "group" => {
+                let mut s = self.conn.prepare("SELECT * FROM groups")?;
+                let rows: Vec<Group> = s
+                    .query_map([], group_from_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                to_json_values(rows)?
+            }
+            "snippet" => {
+                let mut s = self.conn.prepare("SELECT * FROM snippets")?;
+                let rows: Vec<Snippet> = s
+                    .query_map([], snippet_from_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                to_json_values(rows)?
+            }
+            "known_host" => {
+                let mut s = self.conn.prepare("SELECT * FROM known_hosts")?;
+                let rows: Vec<KnownHost> = s
+                    .query_map([], known_host_from_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                to_json_values(rows)?
+            }
+            other => return Err(Error::Invalid(format!("unknown sync kind: {other}"))),
+        };
+        Ok(out)
     }
 
     // ---- groups ----
@@ -280,6 +356,12 @@ impl Db {
         let snippets = self.list_snippets()?;
         Ok(serde_json::to_string_pretty(&Backup { groups: &groups, hosts: &hosts, snippets: &snippets })?)
     }
+}
+
+fn to_json_values<T: Serialize>(rows: Vec<T>) -> Result<Vec<serde_json::Value>> {
+    rows.iter()
+        .map(|e| serde_json::to_value(e).map_err(Into::into))
+        .collect::<Result<Vec<serde_json::Value>>>()
 }
 
 fn kind_str(k: AuthKind) -> &'static str {
