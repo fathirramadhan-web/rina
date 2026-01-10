@@ -14,3 +14,11 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 async-trait = "0.1"
 serde = { workspace = true }
+
+[dev-dependencies]
+# For `PrivateKey::random` (ssh-key uses rand_core 0.10).
+rand = { version = "0.10", features = ["thread_rng"] }
+# Enable async-trait on the SFTP server Handler trait.
+russh-sftp = { version = "4", features = ["async-trait"] }
+async-trait = "0.1"
+tokio = { workspace = true }

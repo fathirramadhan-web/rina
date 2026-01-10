@@ -58,7 +58,7 @@ export interface HostSavePayload {
 }
 
 export function hostSave(p: HostSavePayload): Promise<Host | null> {
-  return call<Host>("host_save", { ...p });
+  return call<Host>("host_save", { input: { ...p } });
 }
 
 export function hostDelete(hostId: string): Promise<boolean> {
