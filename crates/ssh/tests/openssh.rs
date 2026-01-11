@@ -57,6 +57,7 @@ impl russh::server::Server for TestServer {
         TestSession {
             fs: self.fs.clone(),
             channels: Arc::new(Mutex::new(HashMap::new())),
+            shells: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -64,6 +65,7 @@ impl russh::server::Server for TestServer {
 struct TestSession {
     fs: MemFs,
     channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
+    shells: Arc<Mutex<std::collections::HashSet<ChannelId>>>,
 }
 
 impl russh::server::Handler for TestSession {
@@ -116,6 +118,7 @@ impl russh::server::Handler for TestSession {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.shells.lock().await.insert(channel);
         session.channel_success(channel)?;
         Ok(())
     }
@@ -141,6 +144,11 @@ impl russh::server::Handler for TestSession {
         data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        // Echo only on shell channels. SFTP channels carry a binary packet
+        // stream; echoing there corrupts the SFTP framing.
+        if !self.shells.lock().await.contains(&channel) {
+            return Ok(());
+        }
         // Act as a toy shell: echo each line back with a prefix.
         let line = String::from_utf8_lossy(data);
         for cmd in line.split('\n') {
@@ -179,7 +187,6 @@ impl russh::server::Handler for TestSession {
 
 // ---------------------------------------------------------------- SFTP handler
 
-#[async_trait::async_trait]
 impl SftpHandler for MemFs {
     type Error = StatusCode;
 
@@ -196,12 +203,15 @@ impl SftpHandler for MemFs {
 
     async fn open(
         &mut self,
-        id: u32,
+        _id: u32,
         filename: String,
         _pflags: OpenFlags,
         _attrs: FileAttributes,
-    ) -> Result<SftpHandle, Self::Error> {
-        Ok(filename.into())
+    ) -> Result<russh_sftp::protocol::Handle, Self::Error> {
+        Ok(russh_sftp::protocol::Handle {
+            id: _id,
+            handle: filename.into(),
+        })
     }
 
     async fn write(
@@ -259,9 +269,12 @@ impl SftpHandler for MemFs {
         })
     }
 
-    async fn opendir(&mut self, id: u32, _path: String) -> Result<SftpHandle, Self::Error> {
+    async fn opendir(&mut self, id: u32, _path: String) -> Result<russh_sftp::protocol::Handle, Self::Error> {
         self.dir_read_done.store(false, Ordering::SeqCst);
-        Ok("/".into())
+        Ok(russh_sftp::protocol::Handle {
+            id,
+            handle: "/".into(),
+        })
     }
 
     async fn readdir(&mut self, id: u32, _handle: SftpHandle) -> Result<Name, Self::Error> {

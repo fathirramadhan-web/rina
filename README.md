@@ -194,7 +194,7 @@ Terverifikasi nyata di host ini:
 
 Belum terverifikasi (tidak ada Docker/Postgres/sshd di host):
 - Sync end-to-end melawan server Postgres hidup: `crates/sync-server/tests/e2e.rs` sudah ditulis, di-`ignore`, siap dijalankan dengan `DATABASE_URL` + server aktif.
-- Connect SSH ke host sungguhan: test integrasi `crates/ssh/tests/openssh.rs` memakai server russh in-process (bukan OpenSSH container).
+- `crates/ssh/tests/openssh.rs`: 7 test lulus melawan server russh in-process — password auth sukses/gagal, shell echo dua arah, PTY resize, exit status 7, TOFU pin + reconnect tanpa prompt, dan SFTP write/read/list/rename/delete/mkdir/rmdir nyata. Bukan OpenSSH container (tidak ada Docker di host).
 
 ---
 
